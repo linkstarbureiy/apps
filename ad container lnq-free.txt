@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Isolated Ad Container</title>
+    
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <script src="https://www.paypal.com/sdk/js?client-id=YOUR_PAYPAL_CLIENT_ID&currency=USD"></script>
+    
+    <style>
+        .ad-container {
+            position: relative;
+            width: 100%;
+            z-index: 20;
+            transition: max-height 0.3s ease-in-out;
+            overflow-y: auto;
+            background-color: transparent;
+            font-family: monospace;
+            padding: 0;
+            flex-shrink: 0;
+            max-height: 25vh;
+        }
+        .ad-container.collapsed {
+            max-height: 0px; 
+            overflow-y: hidden;
+        }
+        #adContent {
+            padding: 1rem;
+            z-index: 1002;
+        }
+    </style>
+</head>
+<body class="bg-gray-800 flex items-center justify-center h-screen">
+
+    <div class="w-full max-w-sm mt-1 relative pointer-events-auto bg-white/70 backdrop-blur-md rounded-none p-2" id="adContainer"> 
+        <button class="absolute top-1 right-2 hover:opacity-70 font-bold text-sm z-10 cursor-pointer border-none bg-transparent" id="closeAdContainerBtn" onclick="document.getElementById('adContainer').style.display='none';" style="color: #ff0064 !important;" title="close ad container">&#10005;</button> 
+        <div class="w-full pt-3" id="adGrid"></div> 
+    </div>
+
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getFirestore, collection, query, orderBy, onSnapshot, addDoc, doc, updateDoc, deleteDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        
+        // TODO: Initialize your Firebase App here to define window.db
+        /*
+        const firebaseConfig = { apiKey: "...", projectId: "..." };
+        const app = initializeApp(firebaseConfig);
+        window.db = getFirestore(app);
+        */
+
+        // Mock window.showMessageBox for standalone usage
+        window.showMessageBox = window.showMessageBox || function(msg) { alert(msg.replace(/<[^>]*>?/gm, '')); };
+
+        (function() { 
+            let adQueue = []; 
+            let isAdPlaying = false; 
+            let unsubscribeAds = null; 
+
+            function initGlobalAds() { 
+                if (!window.db) { 
+                    console.log("Waiting for window.db initialization...");
+                    setTimeout(initGlobalAds, 1000); 
+                    return; 
+                } 
+                
+                const q = query(collection(window.db, 'global_ads'), orderBy('createdAt', 'asc')); 
+                unsubscribeAds = onSnapshot(q, (snapshot) => { 
+                    adQueue = []; 
+                    snapshot.forEach(docSnap => adQueue.push({ id: docSnap.id, ...docSnap.data() })); 
+                    
+                    if (!isAdPlaying && adQueue.length > 0) { 
+                        playNextAd(); 
+                    } else { 
+                        renderAllAds(); 
+                    } 
+                }); 
+            } 
+
+            initGlobalAds(); 
+
+            function calculateAdCost() { 
+                const durationInput = document.getElementById('duration'); 
+                const posInput = document.getElementById('desiredPos'); 
+                const priceDisplay = document.getElementById('dynPriceDisplay'); 
+                if (!durationInput || !posInput || !priceDisplay) return 0; 
+                
+                const duration = parseInt(durationInput.value) || 0; 
+                const defaultPos = adQueue.length + 1; 
+                let desiredPos = parseInt(posInput.value) || defaultPos; 
+                
+                if (desiredPos < 1) desiredPos = 1; 
+                if (desiredPos > defaultPos) desiredPos = defaultPos; 
+                
+                const jump = defaultPos - desiredPos; 
+                const baseCost = duration / 100;
+                const jumpCost = baseCost * jump; 
+                const totalCost = baseCost + jumpCost; 
+                
+                priceDisplay.textContent = \`$\${totalCost.toFixed(2)} (base: $\${baseCost.toFixed(2)} | jump: $\${jumpCost.toFixed(2)})\`;
+                return totalCost.toFixed(2); 
+            } 
+
+            function renderAdForm() { 
+                const formItem = document.createElement('div');
+                formItem.id = 'adFormItem'; 
+                formItem.className = 'w-full text-[#96afc8] border-t border-[#e9e9e9] pt-0 mt-0'; 
+                let carouselHtml = '';
+                
+                if (adQueue.length > 1) { 
+                    carouselHtml = \`
+                        <div class="text-[#9999ff] text-center mb-1 text-[10px] tracking-widest font-bold uppercase">up next (\${adQueue.length - 1})</div> 
+                        <div class="flex overflow-x-auto gap-2 mb-3 pb-1 snap-x scrollbar-thin scrollbar-thumb-[#9999ff]"> 
+                        \${adQueue.slice(1).map((ad, i) => \`<div class="text-[10px] bg-white border border-[#e9e9e9] px-2 py-1 snap-center whitespace-nowrap">#\${i + 2}: \${ad.duration}s</div>\`).join('')} 
+                        </div>\`; 
+                } 
+                
+                formItem.innerHTML = \`
+                    \${carouselHtml} 
+                    <div class="text-[#00c8c8] text-center mb-2 text-xs tracking-widest lowercase">promote <span style="color:#ff821e; font-weight:bold;">#ads</span> (1¢/sec)</div> 
+                    <form id="adForm" class="space-y-2"> 
+                        <input type="url" id="mediaUrl" placeholder="YouTube URL" class="w-full px-2 py-1 text-xs border border-[#e9e9e9] bg-white/50 focus:outline-none focus:ring-1 focus:ring-[#9999ff] placeholder-[#96afc8] text-[#333333]" /> 
+                        <div id="adPreviewContainer" class="hidden w-full h-32 mt-1 mb-1"></div> 
+                        <div class="flex gap-2"> 
+                            <div class="relative w-1/2"> 
+                                <div class="absolute inset-y-0 left-0 pl-1 flex items-center pointer-events-none"> 
+                                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#96afc8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 12 16 14"></polyline></svg> 
+                                </div> 
+                                <input type="number" id="duration" placeholder="(15-60 sec)" min="15" max="60" class="w-full pl-5 pr-2 py-1 text-xs border border-[#e9e9e9] bg-white/50 text-[#333333]" style="--tw-placeholder-color: #96afc8;"/> 
+                            </div> 
+                            <input type="number" id="desiredPos" placeholder="jump to:" min="1" max="\${adQueue.length + 1}" class="w-1/2 px-2 py-1 text-xs border border-[#e9e9e9] bg-white/50 text-[#333333]" style="--tw-placeholder-color: #96afc8;"/> 
+                        </div> 
+                        <div class="text-xs text-center text-[#00ff00]" id="dynPriceDisplay">$0.00</div> 
+                        <button id="rentButton" type="button" class="w-full bg-[#00ff00] text-base py-1 hover:opacity-80 border-none" style="color: #ffffff !important; display: block; font-size: x-large !important;">rent</button> 
+                        <div id="paypal-button-container-ad" class="hidden mt-2 max-h-[120px] overflow-y-auto"></div> 
+                        <div class="flex justify-center mt-3 mb-1"> 
+                            <button id="adHelpBtn" type="button" class="bg-transparent border-none cursor-pointer hover:scale-110 transition-transform" title="info -how to broadcast"> 
+                                <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#9999ff" stroke-width="1" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"></path><line x1="12" y1="17" x2="12.01" y2="17"></line></svg> 
+                            </button> 
+                        </div> 
+                    </form> 
+                \`; 
+                return formItem; 
+            } 
+
+            function playNextAd() { 
+                const adGrid = document.getElementById('adGrid'); 
+                if (!adGrid) return; 
+                
+                if (adQueue.length === 0) { 
+                    isAdPlaying = false; 
+                    renderAllAds(); 
+                    return; 
+                } 
+                
+                isAdPlaying = true; 
+                const currentAd = adQueue[0]; 
+                
+                if (!currentAd.endTime) { 
+                    currentAd.endTime = Date.now() + (currentAd.duration * 1000); 
+                    updateDoc(doc(window.db, 'global_ads', currentAd.id), { endTime: currentAd.endTime }).catch(()=>{}); 
+                } 
+                
+                if (Date.now() >= currentAd.endTime) { 
+                    finishAd(currentAd.id); 
+                    return; 
+                } 
+                
+                let videoId = 'dQw4w9WgXcQ'; 
+                try { 
+                    const url = new URL(currentAd.mediaUrl);
+                    if (currentAd.mediaUrl.includes('youtu.be/')) videoId = url.pathname.slice(1);
+                    else videoId = url.searchParams.get('v') || videoId; 
+                } catch(e) {} 
+                
+                const elapsedSeconds = Math.floor((currentAd.duration * 1000 - (currentAd.endTime - Date.now())) / 1000); 
+                const startParam = Math.max(0, elapsedSeconds); 
+                
+                adGrid.innerHTML = \`
+                    <div id="liveStage" class="w-full flex flex-col items-center"> 
+                        <iframe src="https://www.youtube.com/embed/\${videoId}?autoplay=1&mute=0&controls=1&start=\${startParam}" class="w-full h-32 border-none" frameborder="0" allow="autoplay; encrypted-media" allowfullscreen></iframe> 
+                        <div class="text-[10px] text-[#ff0064] mt-1 font-bold font-mono tracking-widest countdown-timer"></div> 
+                    </div> 
+                    <div id="submissionBooth"></div> 
+                \`; 
+                
+                adGrid.querySelector('#submissionBooth').appendChild(renderAdForm()); 
+                setupFormListeners(); 
+                
+                const timerEl = adGrid.querySelector('.countdown-timer'); 
+                const expTimer = setInterval(() => { 
+                    const remaining = Math.ceil((currentAd.endTime - Date.now()) / 1000); 
+                    if (remaining <= 0) { 
+                        clearInterval(expTimer); 
+                        finishAd(currentAd.id); 
+                    } else if (timerEl) { 
+                        timerEl.textContent = \`live global event: \${remaining}s\`; 
+                    } 
+                }, 1000); 
+            } 
+
+            function renderAllAds() { 
+                const adGrid = document.getElementById('adGrid');
+                if (!adGrid) return; 
+                 
+                if (!isAdPlaying) { 
+                    adGrid.innerHTML = ''; 
+                    adGrid.appendChild(renderAdForm()); 
+                    setupFormListeners(); 
+                } 
+            } 
+
+            function finishAd(adId) {
+                deleteDoc(doc(window.db, 'global_ads', adId)).catch(()=>{}); 
+            }
+
+            function setupFormListeners() { 
+                const rentButton = document.getElementById('rentButton'); 
+                const durationInput = document.getElementById('duration'); 
+                const posInput = document.getElementById('desiredPos');
+                const mediaUrlInput = document.getElementById('mediaUrl'); 
+                const adHelpBtn = document.getElementById('adHelpBtn'); 
+                const adPreviewContainer = document.getElementById('adPreviewContainer'); 
+                
+                if (adHelpBtn) { 
+                    adHelpBtn.addEventListener('click', () => { 
+                        window.showMessageBox("Instructions: Paste URL, set duration, choose line position, hit rent."); 
+                    });
+                } 
+                
+                if (mediaUrlInput && adPreviewContainer) { 
+                    mediaUrlInput.addEventListener('input', () => { 
+                        const urlStr = mediaUrlInput.value.trim(); 
+                        if (!urlStr.includes('youtu')) { 
+                            adPreviewContainer.innerHTML = ''; 
+                            adPreviewContainer.classList.add('hidden'); 
+                            return; 
+                        } 
+                        
+                        let videoId = ''; 
+                        try { 
+                            const url = new URL(urlStr); 
+                            if (urlStr.includes('youtu.be/')) videoId = url.pathname.slice(1); 
+                            else videoId = url.searchParams.get('v') || ''; 
+                        } catch(e) {} 
+                        
+                        if (videoId) { 
+                            adPreviewContainer.innerHTML = \`<iframe src="https://www.youtube.com/embed/\${videoId}?autoplay=1&mute=1&controls=1" class="w-full h-full border-none" frameborder="0" allow="autoplay; encrypted-media" allowfullscreen></iframe>\`; 
+                            adPreviewContainer.classList.remove('hidden'); 
+                        } 
+                    });
+                } 
+                
+                if (!rentButton) return; 
+                
+                if (durationInput) durationInput.addEventListener('input', calculateAdCost); 
+                if (posInput) posInput.addEventListener('input', calculateAdCost); 
+                
+                rentButton.addEventListener('click', () => { 
+                    const duration = parseInt(document.getElementById('duration').value) || 0; 
+                    const mediaUrl = document.getElementById('mediaUrl').value; 
+                    const targetPos = parseInt(document.getElementById('desiredPos').value) || adQueue.length + 1; 
+                    
+                    if (duration < 15 || duration > 60) return window.showMessageBox('duration must be between 15 and 60s'); 
+                    if (!mediaUrl.includes('youtu')) return window.showMessageBox('must be a valid YouTube URL'); 
+                    
+                    const finalCost = calculateAdCost(); 
+                    rentButton.classList.add('hidden'); 
+                    
+                    const ppContainer = document.getElementById('paypal-button-container-ad'); 
+                    ppContainer.classList.remove('hidden'); 
+                    ppContainer.innerHTML = ''; 
+                    
+                    if (window.paypal) { 
+                        window.paypal.Buttons({ 
+                            createOrder: (data, actions) => actions.order.create({ 
+                                purchase_units: [{ amount: { value: finalCost } }] 
+                            }), 
+                            onApprove: (data, actions) => actions.order.capture().then(() => { 
+                                const timeOffset = (adQueue.length - targetPos + 1) * 1000;
+                                addDoc(collection(window.db, 'global_ads'), { 
+                                    mediaUrl: mediaUrl, 
+                                    duration: duration, 
+                                    createdAt: Date.now() - timeOffset 
+                                }).then(() => { 
+                                    window.showMessageBox('Ad successfully broadcast globally!'); 
+                                    rentButton.classList.remove('hidden'); 
+                                    ppContainer.classList.add('hidden'); 
+                                });  
+                            }), 
+                            onError: () => window.showMessageBox('Payment failed.'), 
+                            onCancel: () => { 
+                                rentButton.classList.remove('hidden');
+                                ppContainer.classList.add('hidden'); 
+                            } 
+                        }).render('#paypal-button-container-ad'); 
+                    } 
+                });
+            } 
+
+            const closeAdBtn = document.getElementById('closeAdContainerBtn');
+            if (closeAdBtn) { 
+                closeAdBtn.addEventListener('click', () => { 
+                    const adContainer = document.getElementById('adContainer'); 
+                    if (adContainer) adContainer.style.display = 'none'; 
+                }); 
+            } 
+        })();
+
+        window.reopenAdContainer = function() { 
+            const adContainer = document.getElementById('adContainer'); 
+            if (adContainer) { 
+                adContainer.style.display = 'block'; 
+                adContainer.classList.remove('hidden'); 
+            } 
+        };
+    </script>
+</body>
+</html>
